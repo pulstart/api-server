@@ -6,7 +6,7 @@ use std::{
 };
 
 use axum::{
-    extract::{ConnectInfo, Json, Path, State},
+    extract::{ConnectInfo, Json, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
@@ -118,6 +118,11 @@ struct CandidatesRequest {
 struct CandidatesResponse {
     status: &'static str,
     partner_candidates: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct SessionStatusRequest {
+    token: String,
 }
 
 #[derive(Serialize)]
@@ -325,11 +330,12 @@ async fn candidates(
     }))
 }
 
-/// GET /api/session/:token — poll session status.
+/// POST /api/session — poll session status.
 async fn session_status(
     State(state): State<AppState>,
-    Path(token): Path<String>,
+    Json(req): Json<SessionStatusRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorBody>)> {
+    let token = req.token;
     let sessions = state.sessions.read().await;
     let session = sessions.get(&token).ok_or_else(|| {
         (
@@ -454,7 +460,7 @@ async fn main() {
         .route("/api/unregister", post(unregister))
         .route("/api/key", post(key_exchange))
         .route("/api/candidates", post(candidates))
-        .route("/api/session/{token}", get(session_status))
+        .route("/api/session", post(session_status))
         .layer(CorsLayer::permissive())
         .with_state(state);
 

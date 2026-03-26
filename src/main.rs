@@ -217,17 +217,20 @@ async fn register(
 
     // Preserve existing fields on re-registration.
     let prev = session.peers.get(&req.role);
+    let is_new = prev.is_none();
     let public_key = prev.and_then(|p| p.public_key.clone());
     let peer_id = req.peer_id.or_else(|| prev.and_then(|p| p.peer_id.clone()));
     let hostname = req.hostname.or_else(|| prev.and_then(|p| p.hostname.clone()));
 
-    info!(
-        role = %req.role,
-        peer_id = peer_id.as_deref().unwrap_or("-"),
-        hostname = hostname.as_deref().unwrap_or("-"),
-        addr = %addr.ip(),
-        "peer registered"
-    );
+    if is_new {
+        info!(
+            role = %req.role,
+            peer_id = peer_id.as_deref().unwrap_or("-"),
+            hostname = hostname.as_deref().unwrap_or("-"),
+            addr = %addr.ip(),
+            "peer registered"
+        );
+    }
 
     session.peers.insert(
         req.role.clone(),

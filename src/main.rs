@@ -30,6 +30,9 @@ struct Peer {
     /// Stable peer identifier (generated once per process lifetime).
     #[serde(skip_serializing_if = "Option::is_none")]
     peer_id: Option<String>,
+    /// Human-readable hostname.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hostname: Option<String>,
     /// Public IP as seen by the API server (without ephemeral port).
     public_ip: String,
     /// X25519 public key (32 bytes, base64-encoded).
@@ -67,9 +70,20 @@ struct RegisterRequest {
     /// Stable peer identifier (generated once per process lifetime).
     #[serde(default)]
     peer_id: Option<String>,
+    /// Human-readable hostname.
+    #[serde(default)]
+    hostname: Option<String>,
     /// Optional local IP:port candidates the peer already knows about.
     #[serde(default)]
     candidates: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct UnregisterRequest {
+    token: String,
+    role: String,
+    #[serde(default)]
+    peer_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -120,6 +134,10 @@ struct SessionStatus {
     host_peer_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     client_peer_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    host_hostname: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client_hostname: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -197,16 +215,18 @@ async fn register(
         }
     }
 
-    // Preserve existing public key and peer_id on re-registration.
+    // Preserve existing fields on re-registration.
     let prev = session.peers.get(&req.role);
     let public_key = prev.and_then(|p| p.public_key.clone());
     let peer_id = req.peer_id.or_else(|| prev.and_then(|p| p.peer_id.clone()));
+    let hostname = req.hostname.or_else(|| prev.and_then(|p| p.hostname.clone()));
 
     session.peers.insert(
         req.role.clone(),
         Peer {
             role: req.role.clone(),
             peer_id,
+            hostname,
             public_ip,
             public_key,
             candidates,
@@ -345,7 +365,36 @@ async fn session_status(
         client_candidates: client.map(|p| p.candidates.clone()).unwrap_or_default(),
         host_peer_id: host.and_then(|p| p.peer_id.clone()),
         client_peer_id: client.and_then(|p| p.peer_id.clone()),
+        host_hostname: host.and_then(|p| p.hostname.clone()),
+        client_hostname: client.and_then(|p| p.hostname.clone()),
     }))
+}
+
+/// POST /api/unregister — remove a peer from a session.
+async fn unregister(
+    State(state): State<AppState>,
+    Json(req): Json<UnregisterRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorBody>)> {
+    validate_role(&req.role)?;
+
+    let mut sessions = state.sessions.write().await;
+    if let Some(session) = sessions.get_mut(&req.token) {
+        // Only remove if peer_id matches (or no peer_id check requested).
+        let should_remove = match (&req.peer_id, session.peers.get(&req.role)) {
+            (Some(req_id), Some(peer)) => peer.peer_id.as_deref() == Some(req_id.as_str()),
+            (None, Some(_)) => true,
+            _ => false,
+        };
+        if should_remove {
+            session.peers.remove(&req.role);
+            info!(token = %req.token, role = %req.role, "peer unregistered");
+            if session.peers.is_empty() {
+                sessions.remove(&req.token);
+            }
+        }
+    }
+
+    Ok(Json(serde_json::json!({"status": "ok"})))
 }
 
 /// GET /health — simple liveness check.
@@ -408,6 +457,7 @@ async fn main() {
     let app = Router::new()
         .route("/health", get(health))
         .route("/api/register", post(register))
+        .route("/api/unregister", post(unregister))
         .route("/api/key", post(key_exchange))
         .route("/api/candidates", post(candidates))
         .route("/api/session/{token}", get(session_status))

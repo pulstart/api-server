@@ -49,7 +49,6 @@ struct Peer {
 #[derive(Clone)]
 struct Session {
     peers: HashMap<String, Peer>, // keyed by role
-    created: Instant,
 }
 
 type SessionMap = Arc<RwLock<HashMap<String, Session>>>;
@@ -196,7 +195,6 @@ async fn register(
     let mut sessions = state.sessions.write().await;
     let session = sessions.entry(req.token.clone()).or_insert_with(|| Session {
         peers: HashMap::new(),
-        created: Instant::now(),
     });
 
     let partner_joined = session.peers.contains_key(partner_role(&req.role));
@@ -424,22 +422,24 @@ async fn cleanup_loop(sessions: SessionMap) {
         tokio::time::sleep(CLEANUP_INTERVAL).await;
         let mut map = sessions.write().await;
         let before = map.len();
-        map.retain(|_token, session| {
-            let dominated_by = session
-                .peers
-                .values()
-                .map(|p| p.last_seen)
-                .max()
-                .unwrap_or(session.created);
-            let alive = dominated_by.elapsed() < SESSION_TTL;
-            if !alive {
-                let peers: Vec<_> = session.peers.values()
-                    .map(|p| format!("{}({})", p.role, p.peer_id.as_deref().unwrap_or("-")))
-                    .collect();
-                info!(peers = ?peers, "session expired");
-            }
-            alive
-        });
+
+        // First, prune individual stale peers within each session.
+        for session in map.values_mut() {
+            session.peers.retain(|_role, peer| {
+                let alive = peer.last_seen.elapsed() < SESSION_TTL;
+                if !alive {
+                    info!(
+                        role = %peer.role,
+                        peer_id = peer.peer_id.as_deref().unwrap_or("-"),
+                        "peer expired"
+                    );
+                }
+                alive
+            });
+        }
+
+        // Then remove empty sessions.
+        map.retain(|_token, session| !session.peers.is_empty());
         let removed = before - map.len();
         if removed > 0 {
             info!(removed, remaining = map.len(), "cleanup sweep");

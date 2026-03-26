@@ -182,13 +182,20 @@ async fn register(
 
     let partner_joined = session.peers.contains_key(partner_role(&req.role));
 
+    // Always include the server-observed public address as a candidate.
+    let mut candidates = req.candidates;
+    let pub_candidate = addr.to_string();
+    if !candidates.contains(&pub_candidate) {
+        candidates.push(pub_candidate);
+    }
+
     session.peers.insert(
         req.role.clone(),
         Peer {
             role: req.role.clone(),
             public_addr: addr,
             public_key: None,
-            candidates: req.candidates,
+            candidates,
             last_seen: Instant::now(),
         },
     );

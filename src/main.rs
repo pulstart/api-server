@@ -199,19 +199,9 @@ async fn register(
 
     let partner_joined = session.peers.contains_key(partner_role(&req.role));
 
-    // Include the server-observed public IP paired with the peer's listen port
-    // (extracted from the first candidate), not the ephemeral HTTP source port.
-    let mut candidates = req.candidates;
-    let public_ip = addr.ip().to_string();
-    if let Some(listen_port) = candidates.first()
-        .and_then(|c| c.rsplit_once(':'))
-        .and_then(|(_, p)| p.parse::<u16>().ok())
-    {
-        let pub_candidate = format!("{}:{}", public_ip, listen_port);
-        if !candidates.contains(&pub_candidate) {
-            candidates.push(pub_candidate);
-        }
-    }
+    // Candidates are now provided by the peer itself (including STUN-discovered
+    // public addresses). The API server just stores them as-is.
+    let candidates = req.candidates;
 
     // Preserve existing fields on re-registration.
     let prev = session.peers.get(&req.role);
@@ -236,7 +226,7 @@ async fn register(
             role: req.role.clone(),
             peer_id,
             hostname,
-            public_ip,
+            public_ip: addr.ip().to_string(),
             public_key,
             candidates,
             last_seen: Instant::now(),
@@ -294,7 +284,7 @@ async fn key_exchange(
 /// POST /api/candidates — share NAT candidates and get partner's candidates.
 async fn candidates(
     State(state): State<AppState>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    ConnectInfo(_addr): ConnectInfo<SocketAddr>,
     Json(req): Json<CandidatesRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorBody>)> {
     validate_role(&req.role)?;
@@ -318,18 +308,9 @@ async fn candidates(
         )
     })?;
 
-    // Include the server-observed public IP paired with the peer's listen port.
-    let mut all_candidates = req.candidates;
-    if let Some(listen_port) = peer.candidates.first()
-        .and_then(|c| c.rsplit_once(':'))
-        .and_then(|(_, p)| p.parse::<u16>().ok())
-    {
-        let pub_candidate = format!("{}:{}", addr.ip(), listen_port);
-        if !all_candidates.contains(&pub_candidate) {
-            all_candidates.push(pub_candidate);
-        }
-    }
-    peer.candidates = all_candidates;
+    // Candidates are provided by the peer itself (including STUN-discovered
+    // public addresses). Just store them.
+    peer.candidates = req.candidates;
     peer.last_seen = Instant::now();
 
     let partner_candidates = session

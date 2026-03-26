@@ -221,6 +221,14 @@ async fn register(
     let peer_id = req.peer_id.or_else(|| prev.and_then(|p| p.peer_id.clone()));
     let hostname = req.hostname.or_else(|| prev.and_then(|p| p.hostname.clone()));
 
+    info!(
+        role = %req.role,
+        peer_id = peer_id.as_deref().unwrap_or("-"),
+        hostname = hostname.as_deref().unwrap_or("-"),
+        addr = %addr.ip(),
+        "peer registered"
+    );
+
     session.peers.insert(
         req.role.clone(),
         Peer {
@@ -233,8 +241,6 @@ async fn register(
             last_seen: Instant::now(),
         },
     );
-
-    info!(token = %req.token, role = %req.role, addr = %addr, "peer registered");
 
     Ok(Json(RegisterResponse {
         status: "ok",
@@ -387,7 +393,8 @@ async fn unregister(
         };
         if should_remove {
             session.peers.remove(&req.role);
-            info!(token = %req.token, role = %req.role, "peer unregistered");
+            let log_id = req.peer_id.as_deref().unwrap_or("-");
+            info!(role = %req.role, peer_id = %log_id, "peer unregistered");
             if session.peers.is_empty() {
                 sessions.remove(&req.token);
             }
@@ -406,7 +413,7 @@ async fn health() -> &'static str {
 // Session cleanup
 // ---------------------------------------------------------------------------
 
-const SESSION_TTL: Duration = Duration::from_secs(5 * 60); // 5 minutes
+const SESSION_TTL: Duration = Duration::from_secs(60);
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(30);
 
 async fn cleanup_loop(sessions: SessionMap) {
@@ -414,7 +421,7 @@ async fn cleanup_loop(sessions: SessionMap) {
         tokio::time::sleep(CLEANUP_INTERVAL).await;
         let mut map = sessions.write().await;
         let before = map.len();
-        map.retain(|token, session| {
+        map.retain(|_token, session| {
             let dominated_by = session
                 .peers
                 .values()
@@ -423,7 +430,10 @@ async fn cleanup_loop(sessions: SessionMap) {
                 .unwrap_or(session.created);
             let alive = dominated_by.elapsed() < SESSION_TTL;
             if !alive {
-                info!(token = %token, "session expired");
+                let peers: Vec<_> = session.peers.values()
+                    .map(|p| format!("{}({})", p.role, p.peer_id.as_deref().unwrap_or("-")))
+                    .collect();
+                info!(peers = ?peers, "session expired");
             }
             alive
         });

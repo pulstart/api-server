@@ -27,8 +27,11 @@ use tracing::info;
 struct Peer {
     /// Which role this peer claimed ("host" or "client").
     role: String,
-    /// Public address as seen by the API server.
-    public_addr: SocketAddr,
+    /// Stable peer identifier (generated once per process lifetime).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    peer_id: Option<String>,
+    /// Public IP as seen by the API server (without ephemeral port).
+    public_ip: String,
     /// X25519 public key (32 bytes, base64-encoded).
     #[serde(skip_serializing_if = "Option::is_none")]
     public_key: Option<String>,
@@ -61,6 +64,9 @@ struct AppState {
 struct RegisterRequest {
     token: String,
     role: String, // "host" or "client"
+    /// Stable peer identifier (generated once per process lifetime).
+    #[serde(default)]
+    peer_id: Option<String>,
     /// Optional local IP:port candidates the peer already knows about.
     #[serde(default)]
     candidates: Vec<String>,
@@ -110,6 +116,10 @@ struct SessionStatus {
     client_has_key: bool,
     host_candidates: Vec<String>,
     client_candidates: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    host_peer_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client_peer_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -171,30 +181,34 @@ async fn register(
         created: Instant::now(),
     });
 
-    if session.peers.contains_key(&req.role) && session.peers[&req.role].public_addr != addr {
-        return Err((
-            StatusCode::CONFLICT,
-            Json(ErrorBody {
-                error: format!("role \"{}\" already taken in this session", req.role),
-            }),
-        ));
-    }
-
     let partner_joined = session.peers.contains_key(partner_role(&req.role));
 
-    // Always include the server-observed public address as a candidate.
+    // Include the server-observed public IP paired with the peer's listen port
+    // (extracted from the first candidate), not the ephemeral HTTP source port.
     let mut candidates = req.candidates;
-    let pub_candidate = addr.to_string();
-    if !candidates.contains(&pub_candidate) {
-        candidates.push(pub_candidate);
+    let public_ip = addr.ip().to_string();
+    if let Some(listen_port) = candidates.first()
+        .and_then(|c| c.rsplit_once(':'))
+        .and_then(|(_, p)| p.parse::<u16>().ok())
+    {
+        let pub_candidate = format!("{}:{}", public_ip, listen_port);
+        if !candidates.contains(&pub_candidate) {
+            candidates.push(pub_candidate);
+        }
     }
+
+    // Preserve existing public key and peer_id on re-registration.
+    let prev = session.peers.get(&req.role);
+    let public_key = prev.and_then(|p| p.public_key.clone());
+    let peer_id = req.peer_id.or_else(|| prev.and_then(|p| p.peer_id.clone()));
 
     session.peers.insert(
         req.role.clone(),
         Peer {
             role: req.role.clone(),
-            public_addr: addr,
-            public_key: None,
+            peer_id,
+            public_ip,
+            public_key,
             candidates,
             last_seen: Instant::now(),
         },
@@ -277,11 +291,16 @@ async fn candidates(
         )
     })?;
 
-    // Always include the server-observed public address as a candidate.
+    // Include the server-observed public IP paired with the peer's listen port.
     let mut all_candidates = req.candidates;
-    let pub_candidate = addr.to_string();
-    if !all_candidates.contains(&pub_candidate) {
-        all_candidates.push(pub_candidate);
+    if let Some(listen_port) = peer.candidates.first()
+        .and_then(|c| c.rsplit_once(':'))
+        .and_then(|(_, p)| p.parse::<u16>().ok())
+    {
+        let pub_candidate = format!("{}:{}", addr.ip(), listen_port);
+        if !all_candidates.contains(&pub_candidate) {
+            all_candidates.push(pub_candidate);
+        }
     }
     peer.candidates = all_candidates;
     peer.last_seen = Instant::now();
@@ -324,6 +343,8 @@ async fn session_status(
         client_has_key: client.and_then(|p| p.public_key.as_ref()).is_some(),
         host_candidates: host.map(|p| p.candidates.clone()).unwrap_or_default(),
         client_candidates: client.map(|p| p.candidates.clone()).unwrap_or_default(),
+        host_peer_id: host.and_then(|p| p.peer_id.clone()),
+        client_peer_id: client.and_then(|p| p.peer_id.clone()),
     }))
 }
 

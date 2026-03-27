@@ -196,8 +196,28 @@ async fn register(
     Json(req): Json<RegisterRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorBody>)> {
     validate_role(&req.role)?;
+    if req.token.len() > MAX_TOKEN_LEN {
+        return Err((StatusCode::BAD_REQUEST, Json(ErrorBody { error: "token too long".into() })));
+    }
+    if req.peer_id.as_ref().map_or(false, |s| s.len() > MAX_STRING_FIELD_LEN) {
+        return Err((StatusCode::BAD_REQUEST, Json(ErrorBody { error: "peer_id too long".into() })));
+    }
+    if req.hostname.as_ref().map_or(false, |s| s.len() > MAX_STRING_FIELD_LEN) {
+        return Err((StatusCode::BAD_REQUEST, Json(ErrorBody { error: "hostname too long".into() })));
+    }
 
     let mut sessions = state.sessions.write().await;
+
+    // Reject new sessions when the server is at capacity.
+    if !sessions.contains_key(&req.token) && sessions.len() >= MAX_SESSIONS {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(ErrorBody {
+                error: "too many active sessions".into(),
+            }),
+        ));
+    }
+
     let session = sessions.entry(req.token.clone()).or_insert_with(|| Session {
         peers: HashMap::new(),
     });
@@ -206,7 +226,11 @@ async fn register(
 
     // Candidates are now provided by the peer itself (including STUN-discovered
     // public addresses). The API server just stores them as-is.
-    let candidates = req.candidates;
+    // Truncate to prevent oversized candidate lists.
+    let mut candidates: Vec<String> = req.candidates.into_iter()
+        .filter(|c| c.len() <= MAX_STRING_FIELD_LEN)
+        .collect();
+    candidates.truncate(MAX_CANDIDATES);
 
     // Preserve existing fields on re-registration.
     let prev = session.peers.get(&req.role);
@@ -314,8 +338,12 @@ async fn candidates(
     })?;
 
     // Candidates are provided by the peer itself (including STUN-discovered
-    // public addresses). Just store them.
-    peer.candidates = req.candidates;
+    // public addresses). Just store them (truncated to cap).
+    let mut cands: Vec<String> = req.candidates.into_iter()
+        .filter(|c| c.len() <= MAX_STRING_FIELD_LEN)
+        .collect();
+    cands.truncate(MAX_CANDIDATES);
+    peer.candidates = cands;
     peer.last_seen = Instant::now();
 
     let partner_candidates = session
@@ -403,6 +431,13 @@ async fn health() -> &'static str {
 
 const SESSION_TTL: Duration = Duration::from_secs(60);
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(30);
+/// Hard cap on concurrent sessions to prevent memory exhaustion.
+const MAX_SESSIONS: usize = 1000;
+/// Hard cap on candidate addresses per peer.
+const MAX_CANDIDATES: usize = 32;
+/// Hard cap on string field lengths to prevent memory abuse.
+const MAX_TOKEN_LEN: usize = 256;
+const MAX_STRING_FIELD_LEN: usize = 256;
 
 async fn cleanup_loop(sessions: SessionMap) {
     loop {

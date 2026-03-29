@@ -49,6 +49,7 @@ struct Peer {
 #[derive(Clone)]
 struct Session {
     peers: HashMap<String, Peer>, // keyed by role
+    punch_nonces: HashMap<String, u64>, // keyed by role
 }
 
 type SessionMap = Arc<RwLock<HashMap<String, Session>>>;
@@ -121,6 +122,13 @@ struct CandidatesResponse {
 }
 
 #[derive(Deserialize)]
+struct PunchRequest {
+    token: String,
+    role: String,
+    nonce: u64,
+}
+
+#[derive(Deserialize)]
 struct SessionStatusRequest {
     token: String,
 }
@@ -142,6 +150,8 @@ struct SessionStatus {
     host_hostname: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     client_hostname: Option<String>,
+    host_punch_nonce: u64,
+    client_punch_nonce: u64,
 }
 
 #[derive(Serialize)]
@@ -220,6 +230,7 @@ async fn register(
 
     let session = sessions.entry(req.token.clone()).or_insert_with(|| Session {
         peers: HashMap::new(),
+        punch_nonces: HashMap::new(),
     });
 
     let partner_joined = session.peers.contains_key(partner_role(&req.role));
@@ -358,6 +369,39 @@ async fn candidates(
     }))
 }
 
+/// POST /api/punch — record a monotonic punch request nonce for a peer.
+async fn request_punch(
+    State(state): State<AppState>,
+    Json(req): Json<PunchRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorBody>)> {
+    validate_role(&req.role)?;
+
+    let mut sessions = state.sessions.write().await;
+    let session = sessions.get_mut(&req.token).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ErrorBody {
+                error: "session not found".into(),
+            }),
+        )
+    })?;
+
+    let peer = session.peers.get_mut(&req.role).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ErrorBody {
+                error: "peer not registered in session".into(),
+            }),
+        )
+    })?;
+    peer.last_seen = Instant::now();
+
+    let entry = session.punch_nonces.entry(req.role).or_insert(0);
+    *entry = (*entry).max(req.nonce);
+
+    Ok(Json(serde_json::json!({"status": "ok"})))
+}
+
 /// POST /api/session — poll session status.
 async fn session_status(
     State(state): State<AppState>,
@@ -389,6 +433,8 @@ async fn session_status(
         client_peer_id: client.and_then(|p| p.peer_id.clone()),
         host_hostname: host.and_then(|p| p.hostname.clone()),
         client_hostname: client.and_then(|p| p.hostname.clone()),
+        host_punch_nonce: session.punch_nonces.get("host").copied().unwrap_or(0),
+        client_punch_nonce: session.punch_nonces.get("client").copied().unwrap_or(0),
     }))
 }
 
@@ -409,6 +455,7 @@ async fn unregister(
         };
         if should_remove {
             session.peers.remove(&req.role);
+            session.punch_nonces.remove(&req.role);
             let log_id = req.peer_id.as_deref().unwrap_or("-");
             info!(role = %req.role, peer_id = %log_id, "peer unregistered");
             if session.peers.is_empty() {
@@ -458,6 +505,9 @@ async fn cleanup_loop(sessions: SessionMap) {
                 }
                 alive
             });
+            session
+                .punch_nonces
+                .retain(|role, _| session.peers.contains_key(role));
         }
 
         // Then remove empty sessions.
@@ -495,6 +545,7 @@ async fn main() {
         .route("/api/unregister", post(unregister))
         .route("/api/key", post(key_exchange))
         .route("/api/candidates", post(candidates))
+        .route("/api/punch", post(request_punch))
         .route("/api/session", post(session_status))
         .layer(CorsLayer::permissive())
         .with_state(state);

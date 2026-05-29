@@ -247,13 +247,27 @@ async fn register(
     let prev = session.peers.get(&req.role);
     let is_new = prev.is_none();
     let public_key = prev.and_then(|p| p.public_key.clone());
+    // peer_id is the stable identity clients use to merge a host's LAN and public
+    // variants into one entry. Require it (non-empty) so an identity-less host can
+    // never be advertised; the host always sends one.
     let peer_id = req.peer_id.or_else(|| prev.and_then(|p| p.peer_id.clone()));
+    let peer_id = match peer_id {
+        Some(p) if !p.is_empty() => p,
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorBody {
+                    error: "peer_id required".into(),
+                }),
+            ));
+        }
+    };
     let hostname = req.hostname.or_else(|| prev.and_then(|p| p.hostname.clone()));
 
     if is_new {
         info!(
             role = %req.role,
-            peer_id = peer_id.as_deref().unwrap_or("-"),
+            peer_id = %peer_id,
             hostname = hostname.as_deref().unwrap_or("-"),
             addr = %addr.ip(),
             "peer registered"
@@ -264,7 +278,7 @@ async fn register(
         req.role.clone(),
         Peer {
             role: req.role.clone(),
-            peer_id,
+            peer_id: Some(peer_id),
             hostname,
             public_ip: addr.ip().to_string(),
             public_key,

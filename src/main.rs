@@ -131,6 +131,11 @@ struct PunchRequest {
 #[derive(Deserialize)]
 struct SessionStatusRequest {
     token: String,
+    /// Role of the polling peer ("host"/"client"), if known. Polling is a sign
+    /// of life, so refresh that peer's `last_seen` here — otherwise a peer that
+    /// has gone quiet except for session polls ages out at SESSION_TTL.
+    #[serde(default)]
+    role: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -274,6 +279,15 @@ async fn register(
     let prev = session.peers.get(&req.role);
     let is_new = prev.is_none();
     let public_key = prev.and_then(|p| p.public_key.clone());
+    // Don't let a register carrying an empty (not-yet-gathered) candidate list
+    // clobber candidates the same peer uploaded moments earlier — e.g. a
+    // periodic re-register firing before STUN finished. Preserve the previous
+    // list when the incoming one is empty (mirrors the public_key-preserve).
+    let candidates = if candidates.is_empty() {
+        prev.map(|p| p.candidates.clone()).unwrap_or_default()
+    } else {
+        candidates
+    };
     // peer_id is the stable identity clients use to merge a host's LAN and public
     // variants into one entry. Require it (non-empty) so an identity-less host can
     // never be advertised; the host always sends one.
@@ -453,8 +467,8 @@ async fn session_status(
     Json(req): Json<SessionStatusRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorBody>)> {
     let token = req.token;
-    let sessions = state.sessions.read().await;
-    let session = sessions.get(&token).ok_or_else(|| {
+    let mut sessions = state.sessions.write().await;
+    let session = sessions.get_mut(&token).ok_or_else(|| {
         (
             StatusCode::NOT_FOUND,
             Json(ErrorBody {
@@ -462,6 +476,15 @@ async fn session_status(
             }),
         )
     })?;
+
+    // Polling is a sign of life — refresh the polling peer so a peer that has
+    // gone quiet except for session polls doesn't age out at SESSION_TTL
+    // mid-handshake (e.g. during a slow hole punch).
+    if let Some(role) = req.role.as_deref() {
+        if let Some(peer) = session.peers.get_mut(role) {
+            peer.last_seen = Instant::now();
+        }
+    }
 
     let host = session.peers.get("host");
     let client = session.peers.get("client");
@@ -521,7 +544,7 @@ async fn health() -> &'static str {
 // Session cleanup
 // ---------------------------------------------------------------------------
 
-const SESSION_TTL: Duration = Duration::from_secs(60);
+const SESSION_TTL: Duration = Duration::from_secs(120);
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(30);
 /// Hard cap on concurrent sessions to prevent memory exhaustion.
 const MAX_SESSIONS: usize = 1000;

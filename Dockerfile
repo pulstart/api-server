@@ -16,6 +16,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 COPY --from=builder /app/target/release/st-api-server /usr/local/bin/st-api-server
 
 ENV BIND_ADDR=0.0.0.0:3000
-EXPOSE 3000
+EXPOSE 3000 3001
 
 CMD ["st-api-server"]

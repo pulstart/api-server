@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::SocketAddr,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -210,6 +210,7 @@ struct RegisterResponse {
     status: &'static str,
     role: String,
     partner_joined: bool,
+    session: SessionStatus,
 }
 
 #[derive(Serialize)]
@@ -234,6 +235,7 @@ struct PeerStatus {
     lease_id: String,
     hostname: Option<String>,
     has_key: bool,
+    public_key: Option<String>,
     candidates: Vec<String>,
 }
 
@@ -384,6 +386,7 @@ fn peer_status(peer: &Peer) -> PeerStatus {
         lease_id: peer.lease_id.clone(),
         hostname: peer.hostname.clone(),
         has_key: peer.public_key.is_some(),
+        public_key: peer.public_key.clone(),
         candidates: peer.candidates.clone(),
     }
 }
@@ -438,12 +441,10 @@ fn prune_store(store: &mut Store) {
     store
         .sessions
         .retain(|_, session| !session.peers.is_empty());
-    let sessions = &store.sessions;
+    let session_ids: HashSet<&str> = store.sessions.values().map(|s| s.id.as_str()).collect();
+    let now = Instant::now();
     store.tickets.retain(|_, ticket| {
-        ticket.expires_at > Instant::now()
-            && sessions
-                .values()
-                .any(|session| session.id == ticket.session_id)
+        ticket.expires_at > now && session_ids.contains(ticket.session_id.as_str())
     });
 }
 
@@ -651,6 +652,7 @@ async fn register(
         status: "ok",
         role: req.role,
         partner_joined,
+        session: session_snapshot(session, state.advertised_relay_port()),
     }))
 }
 
@@ -1019,7 +1021,16 @@ async fn session_status(
             .expect("owner validated")
             .last_seen = Instant::now();
     }
-    Ok(Json(SessionStatus {
+    Ok(Json(session_snapshot(
+        session,
+        state.advertised_relay_port(),
+    )))
+}
+
+// Build under the store lock so identities, keys, candidates and request contexts
+// all describe the same peer leases. Registration doubles as a signaling poll.
+fn session_snapshot(session: &Session, relay_port: Option<u16>) -> SessionStatus {
+    SessionStatus {
         session_id: session.id.clone(),
         host: session.peers.get("host").map(peer_status),
         client: session.peers.get("client").map(peer_status),
@@ -1027,8 +1038,8 @@ async fn session_status(
         client_punch_request: session.punch_requests.get("client").map(request_status),
         host_relay_request: session.relay_requests.get("host").map(request_status),
         client_relay_request: session.relay_requests.get("client").map(request_status),
-        relay_port: state.advertised_relay_port(),
-    }))
+        relay_port,
+    }
 }
 
 async fn unregister(
@@ -1050,6 +1061,23 @@ async fn unregister(
         }
     }
     prune_store(&mut store);
+    Ok(Json(serde_json::json!({"status": "ok"})))
+}
+
+async fn heartbeat(
+    State(state): State<AppState>,
+    Json(req): Json<OwnedRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    validate_identity(&req.role, &req.token, &req.peer_id, &req.lease_id)?;
+    let mut store = state.store.write().await;
+    prune_store(&mut store);
+    let session = session_mut(&mut store, &req.token)?;
+    validate_owner(session, &req.role, &req.peer_id, &req.lease_id)?;
+    session
+        .peers
+        .get_mut(&req.role)
+        .expect("owner validated")
+        .last_seen = Instant::now();
     Ok(Json(serde_json::json!({"status": "ok"})))
 }
 
@@ -1326,6 +1354,7 @@ fn build_router(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/api/register", post(register))
         .route("/api/unregister", post(unregister))
+        .route("/api/heartbeat", post(heartbeat))
         .route("/api/key", post(key_exchange))
         .route("/api/candidates", post(candidates))
         .route("/api/punch", post(request_punch))
@@ -1496,6 +1525,97 @@ mod tests {
             register_peer(state, token, "client", "client-peer", "client-lease").await,
             StatusCode::OK
         );
+    }
+
+    #[tokio::test]
+    async fn registration_snapshot_contains_first_punch_and_current_candidates() {
+        let state = test_state(Some(3001), 1);
+        register_pair(&state, "token").await;
+        let key = BASE64.encode([7u8; 32]);
+        let registration = json!({
+            "token": "token", "role": "client", "peer_id": "client-peer",
+            "lease_id": "client-lease", "public_key": key,
+            "candidates": ["127.0.0.1:6000"]
+        });
+        assert_eq!(
+            post(&state, "/api/register", registration.clone()).await.0,
+            StatusCode::OK
+        );
+        let request = json!({
+            "token": "token", "role": "client", "peer_id": "client-peer",
+            "lease_id": "client-lease", "expected_partner_peer_id": "host-peer",
+            "expected_partner_lease_id": "host-lease", "generation": 1
+        });
+        let (status, punch) = post(&state, "/api/punch", request).await;
+        assert_eq!(status, StatusCode::OK);
+        let host_poll = json!({
+            "token": "token", "role": "host", "peer_id": "host-peer",
+            "lease_id": "host-lease"
+        });
+        let (status, response) = post(&state, "/api/register", host_poll.clone()).await;
+        assert_eq!(status, StatusCode::OK);
+        let snapshot = &response["session"];
+        assert_eq!(snapshot["client"]["public_key"], key);
+        assert_eq!(snapshot["client"]["candidates"], json!(["127.0.0.1:6000"]));
+        assert_eq!(
+            snapshot["client_punch_request"]["context"],
+            punch["context"]
+        );
+        assert_eq!(snapshot["client_punch_request"]["generation"], 1);
+        assert_eq!(snapshot["relay_port"], 3001);
+        // Renewal must preserve the first request; it must not need a second connect.
+        post(&state, "/api/register", registration).await;
+        let (_, renewed) = post(&state, "/api/register", host_poll).await;
+        assert_eq!(
+            renewed["session"]["client_punch_request"]["context"],
+            punch["context"]
+        );
+    }
+
+    #[tokio::test]
+    async fn heartbeat_renews_only_the_live_owner_without_resurrecting_leases() {
+        let state = test_state(None, 1);
+        register_pair(&state, "token").await;
+        let request = json!({"token": "token", "role": "client",
+            "peer_id": "client-peer", "lease_id": "client-lease"});
+        {
+            let mut store = state.store.write().await;
+            store
+                .sessions
+                .get_mut("token")
+                .unwrap()
+                .peers
+                .get_mut("client")
+                .unwrap()
+                .last_seen = Instant::now() - Duration::from_secs(100);
+        }
+        assert_eq!(
+            post(&state, "/api/heartbeat", request.clone()).await.0,
+            StatusCode::OK
+        );
+        assert!(
+            state.store.read().await.sessions["token"].peers["client"]
+                .last_seen
+                .elapsed()
+                < Duration::from_secs(1)
+        );
+        let mut stale = request.clone();
+        stale["lease_id"] = json!("old-lease");
+        assert_eq!(
+            post(&state, "/api/heartbeat", stale).await.0,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            post(&state, "/api/unregister", request.clone()).await.0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            post(&state, "/api/heartbeat", request).await.0,
+            StatusCode::NOT_FOUND
+        );
+        assert!(!state.store.read().await.sessions["token"]
+            .peers
+            .contains_key("client"));
     }
 
     async fn relay_ticket_pair(state: &AppState, token: &str, generation: u64) -> (String, String) {
